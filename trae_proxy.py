@@ -1308,6 +1308,11 @@ API_KEY = None
 SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
 
 
+def _credit_pack_view(pack, now=None):
+    """一个上游权益包 → 面板可渲染的 dict（单一实现见 trae_accounts.credit_pack_view）。"""
+    return trae_accounts.credit_pack_view(pack, now)
+
+
 def account_credit_view(account):
     """Normalize plan + check-in credits + quota for dashboard/API."""
     ent = getattr(account, "entitlement", None) or {}
@@ -1319,7 +1324,6 @@ def account_credit_view(account):
             if isinstance(item, dict):
                 pack = item
                 break
-    plan = str(pack.get("display_desc") or "")
     quota = pack.get("quota") if isinstance(pack.get("quota"), dict) else {}
     used = pack.get("usage") if isinstance(pack.get("usage"), dict) else {}
     summary = usage.get("usage_summary") if isinstance(usage.get("usage_summary"), dict) else {}
@@ -1335,6 +1339,15 @@ def account_credit_view(account):
     remain = max(0, limit - consumed)
     if isinstance(remain, float):
         remain = round(remain, 2)
+    # 权益包明细（含每个包的过期时间）。数据本来就在 entitlement 里，以前没往外导。
+    now = time.time()
+    pack_views = trae_accounts.credit_pack_views(ent, now)
+    # plan：老实现取 packs[0].display_desc，而首项常是「免费」(权限包) 或首个赠包，
+    # 会被误读成套餐名。改为「未过期、额度最大」的积分包名，没有积分包才退回首项。
+    plan = trae_accounts.credit_plan_name(pack_views, str(pack.get("display_desc") or ""))
+    upcoming = sorted([p for p in pack_views if p["expire_ts"] and not p["expired"]],
+                      key=lambda p: p["expire_ts"])
+    next_pack = upcoming[0] if upcoming else None
     checkin = (getattr(account, "extra", {}) or {}).get("checkin") or {}
     try:
         checkin_credits = int(checkin.get("credits") or 0)
@@ -1349,6 +1362,12 @@ def account_credit_view(account):
         "limit": limit,
         "used": consumed,
         "total": limit,
+        "packs": pack_views,
+        "packs_count": len(pack_views),
+        "packs_expiring": len([p for p in pack_views if p["expiring"]]),
+        "packs_expired": len([p for p in pack_views if p["expired"]]),
+        "next_expire_at": next_pack["expire_at"] if next_pack else "",
+        "next_expire_days": next_pack["days_left"] if next_pack else None,
         "updated_at": getattr(account, "usage_updated_at", 0) or 0,
         "source": "entitlement+checkin",
     }

@@ -878,6 +878,103 @@ class RefreshPayload(dict):
         return dict(self)
 
 
+def credit_pack_view(pack, now=None):
+    """一个上游权益包 → 面板可直接渲染的 dict（额度 / 已用 / 剩余 / 过期 / 剩余天数）。
+
+    上游 user_entitlement_pack_list 里每个包都带额度与过期时间，但字段位置不统一：
+    额度在 entitlement_base_info.quota.credits_limit（不在包顶层 quota），
+    过期在包顶 expire_time 或 entitlement_base_info.end_time。这里统一拍平。
+    """
+    if not isinstance(pack, dict):
+        return None
+    now = time.time() if now is None else now
+    base = pack.get("entitlement_base_info")
+    base = base if isinstance(base, dict) else {}
+    quota = base.get("quota") if isinstance(base.get("quota"), dict) else {}
+    if not quota and isinstance(pack.get("quota"), dict):
+        quota = pack["quota"]
+    used_obj = pack.get("usage") if isinstance(pack.get("usage"), dict) else {}
+
+    def _num(value):
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    limit = _num(quota.get("credits_limit"))
+    used = _num(used_obj.get("credits_amount")) or 0.0
+    remain = max(0.0, limit - used) if limit is not None else None
+    expire_ts = _num(pack.get("expire_time")) or _num(base.get("end_time")) or 0.0
+    start_ts = _num(base.get("start_time")) or 0.0
+    days_left = round((expire_ts - now) / 86400.0, 1) if expire_ts else None
+    expired = bool(days_left is not None and days_left < 0)
+    exhausted = bool(remain is not None and remain <= 0)
+    # 权限包（免费等）：上游不发积分，quota 里只有能力开关 + 并发上限，
+    # 例如 {"enable_solo_agent": true, ..., "solo_agent_parallel_limit": 2}。
+    # 把这些抠出来，面板就不会只显示一个没信息量的「权限包」。
+    features = []
+    if limit is None:
+        for key, val in quota.items():
+            if isinstance(val, bool) and val and key.startswith("enable_"):
+                features.append(key[len("enable_"):])
+        features.sort()
+    parallel = quota.get("solo_agent_parallel_limit")
+    return {
+        "name": str(pack.get("display_desc") or pack.get("group_name") or "权益包"),
+        "group": str(pack.get("group_name") or ""),
+        "kind": "credits" if limit else "permission",
+        "limit": round(limit, 2) if limit is not None else None,
+        "used": round(used, 2),
+        "remain": round(remain, 2) if remain is not None else None,
+        "start_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(start_ts)) if start_ts else "",
+        "expire_at": time.strftime("%Y-%m-%d %H:%M", time.localtime(expire_ts)) if expire_ts else "",
+        "expire_ts": int(expire_ts),
+        "days_left": days_left,
+        "expired": expired,
+        "exhausted": exhausted,
+        "features": features,
+        "parallel": int(parallel) if isinstance(parallel, (int, float)) and not isinstance(parallel, bool) else None,
+        # 已用光的积分包不再提醒「快过期了」——没东西可损失；权限包 remain 为 None 仍要提醒。
+        "expiring": bool(days_left is not None and 0 <= days_left < 7
+                         and (remain is None or remain > 0)),
+        "status": pack.get("status"),
+    }
+
+
+def credit_pack_views(entitlement, now=None):
+    """entitlement blob → [credit_pack_view, ...]，按过期时间升序（最快的排最前）。
+
+    没带过期时间的包（expire_ts=0）视为最后。
+    """
+    ent = entitlement if isinstance(entitlement, dict) else {}
+    usage = ent.get("ent_usage") if isinstance(ent.get("ent_usage"), dict) else {}
+    packs = usage.get("user_entitlement_pack_list") or []
+    if not isinstance(packs, list):
+        return []
+    now = time.time() if now is None else now
+    out = []
+    for item in packs:
+        view = credit_pack_view(item, now)
+        if view:
+            out.append(view)
+    out.sort(key=lambda p: (p.get("expire_ts") or 9.0e18, p.get("expire_ts") or 0))
+    return out
+
+
+def credit_plan_name(pack_views, fallback=""):
+    """「套餐名」= 未过期、额度最大的积分包名。
+
+    老代码取 packs[0].display_desc，首项常是「免费」(权限包) 或最早的赠包，
+    会被当成套餐名展示（…6291 显示「免费」就是这个原因），这里纠正。
+    """
+    live = [p for p in (pack_views or []) if p.get("kind") == "credits" and not p.get("expired")]
+    if live:
+        return str(max(live, key=lambda p: p.get("limit") or 0).get("name") or "")
+    if pack_views:
+        return str(pack_views[0].get("name") or "")
+    return fallback
+
+
 class Account(object):
     """一个 Trae 账号（跨 CN / INTL 同构）。
 
@@ -1594,15 +1691,25 @@ class Account(object):
             credits = int(checkin.get("credits") or 0)
         except (TypeError, ValueError):
             credits = 0
+        pack_views = credit_pack_views(ent)
+        upcoming = sorted([p for p in pack_views if p["expire_ts"] and not p["expired"]],
+                          key=lambda p: p["expire_ts"])
+        next_pack = upcoming[0] if upcoming else None
         return {
             "checkin": credits,
             "checkin_at": checkin.get("at") or "",
             "checked_in": bool(checkin.get("checked_in")),
-            "plan": str(pack.get("display_desc") or ""),
+            "plan": credit_plan_name(pack_views, str(pack.get("display_desc") or "")),
             "remain": remain,
             "limit": limit,
             "used": consumed,
             "total": limit,
+            "packs": pack_views,
+            "packs_count": len(pack_views),
+            "packs_expiring": len([p for p in pack_views if p["expiring"]]),
+            "packs_expired": len([p for p in pack_views if p["expired"]]),
+            "next_expire_at": next_pack["expire_at"] if next_pack else "",
+            "next_expire_days": next_pack["days_left"] if next_pack else None,
             "updated_at": getattr(account, "usage_updated_at", 0) or 0,
         }
 

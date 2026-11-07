@@ -2589,12 +2589,13 @@ function accountEntitlementText(a){
   const usage = ent.ent_usage || ent;
   const packs = (usage && usage.user_entitlement_pack_list) || [];
   const first = packs.find(p => p && p.quota && Number(p.quota.advanced_model_request_limit) > 0) || packs[0] || {};
-  const plan = first.display_desc || (a.plan && a.plan.display_desc) || '';
+  const cr = (a.credits && typeof a.credits === 'object') ? a.credits : {};
+  // plan 优先用后端算好的（未过期、额度最大的积分包名）；老逻辑取 packs[0] 会把「免费」当套餐名。
+  const plan = cr.plan || first.display_desc || (a.plan && a.plan.display_desc) || '';
   const quota = first.quota || {};
   const adv = quota.advanced_model_request_limit;
   const fast = quota.premium_model_fast_request_limit;
   const bits = [];
-  const cr = (a.credits && typeof a.credits === 'object') ? a.credits : {};
   if(cr.remain != null && Number(cr.limit) > 0){
     bits.push('<b style="color:var(--accent2)">总积分 ' + fmt(cr.remain) + '</b>');
   }
@@ -2614,6 +2615,52 @@ function accountEntitlementText(a){
   }
   if(!bits.length) bits.push('<span style="color:var(--dim)">未查询</span>');
   return bits.join(' · ');
+}
+// 权益包明细：每个包一行（名称 / 剩余额度 / 过期日 / 剩余天数）。数据来自
+// /accounts → credits.packs（trae_proxy.account_credit_view 已拍平并算好 days_left）。
+// 剩余 < 7 天标红 + ⏰，已过期置灰划掉；权限包（无 credits_limit）显示「权限包」而不是 0。
+function creditPackLines(a){
+  const c = (a && a.credits && typeof a.credits === 'object') ? a.credits : {};
+  const packs = Array.isArray(c.packs) ? c.packs : [];
+  if(!packs.length) return '';
+  const rows = packs.map(function(p){
+    const isPerm = (p.kind !== 'credits') || p.limit == null;
+    // 权限包没有积分额度，但带能力开关与并发上限 —— 显示这些，别只写「权限包」。
+    const permBits = [];
+    if(isPerm){
+      if(p.parallel != null) permBits.push('Solo 并发 ' + p.parallel);
+      if(Array.isArray(p.features) && p.features.length) permBits.push(p.features.length + ' 项能力');
+    }
+    const amt = isPerm
+      ? '<span style="color:var(--dim)">权限包</span>' + (permBits.length ? ' <span style="color:var(--dim)">· ' + esc(permBits.join(' · ')) + '</span>' : '')
+      : '剩 <b style="color:' + (Number(p.remain) > 0 ? 'var(--fg)' : 'var(--dim)') + '">' + fmt(p.remain) + '</b>/' + fmt(p.limit);
+    let days = '';
+    if(p.days_left != null){
+      days = p.expired ? '已过期'
+        : (Math.abs(p.days_left) < 1 ? '不足1天' : Math.round(p.days_left) + '天');
+    }
+    const dead = p.expired || p.exhausted;
+    const color = dead ? 'var(--dim)' : (p.expiring ? 'var(--bad)' : 'var(--dim)');
+    const mark = p.expiring ? '⏰ ' : (p.expired ? '✕ ' : '');
+    const tail = p.exhausted && !p.expired ? '（已用完）' : '';
+    // 已用完 → 整行划横线（用户 2026-11-07 要求）
+    const strike = p.exhausted ? 'text-decoration:line-through;' : '';
+    const tip = '起 ' + (p.start_at || '?') + ' · 止 ' + (p.expire_at || '?')
+      + (p.group ? ' · ' + p.group : '')
+      + (isPerm
+          ? ' · 权限包，不含积分' + (Array.isArray(p.features) && p.features.length ? '；能力：' + p.features.join(', ') : '')
+          : '');
+    return '<div class="mono" title="' + esc(tip) + '" style="font-size:10px;line-height:1.5;color:' + color + ';'
+      + strike + 'white-space:nowrap">'
+      + mark + esc(p.name) + ' ' + amt + ' · ' + esc(String(p.expire_at || '?').slice(5))
+      + (days ? '（' + days + '）' : '') + tail + '</div>';
+  }).join('');
+  const warn = Number(c.packs_expiring) > 0
+    ? '<div class="mono" style="font-size:10px;color:var(--bad);margin-top:2px">⏰ '
+      + c.packs_expiring + ' 个权益包 7 天内到期</div>'
+    : '';
+  return '<div style="margin-top:4px;padding-top:3px;border-top:1px dashed rgba(255,255,255,.10)">'
+    + rows + warn + '</div>';
 }
 function accountRow(a){
   const realmBadge = a.realm === 'cn'
@@ -2637,7 +2684,8 @@ function accountRow(a){
   const refresh = a.refreshToken || {};
   const credText = accountEntitlementText(a)
     + '<div class="mono" style="font-size:10px;color:var(--dim);margin-top:2px">到期 ' + esc(a.expiresIn || '?')
-    + ' · token ' + (token.length || 0) + ' · 续期 ' + (refresh.present ? (a.refreshExpiresIn || '?') : '无') + '</div>';
+    + ' · token ' + (token.length || 0) + ' · 续期 ' + (refresh.present ? (a.refreshExpiresIn || '?') : '无') + '</div>'
+    + creditPackLines(a);
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
@@ -2693,7 +2741,7 @@ function renderAccounts(){
     + '<th style="text-align:center;width:76px">区域</th>'
     + '<th style="text-align:left">账号</th>'
     + '<th style="text-align:center;width:84px">状态</th>'
-    + '<th style="text-align:left;width:220px">权益 / 凭证</th>'
+    + '<th style="text-align:left;width:300px">权益 / 凭证</th>'
     + '<th style="text-align:right;width:70px">请求</th>'
     + '<th style="text-align:right;width:88px">总 token</th>'
     + '<th style="text-align:right;width:80px">缓存</th>'
