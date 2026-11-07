@@ -10333,31 +10333,31 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts/import/desktop":
             # 两步确认：{} 只读扫描（双区：桌面 App auth.v1.dat + CLI user）；
             # {"path":...} 按确认导入该凭证；{"all":true} 导入全部有效项。
+            #
+            # 注意：import_desktop_credential() 返回的是**结果 dict**
+            # （{found, preview, accounts:[public()...], errors, imported, updated}），
+            # 不是 Account 对象。早先这里按对象取 .uid / .public()，导入其实已经
+            # 写盘成功，但打日志时抛 AttributeError -> 连接被掐断 -> 前端显示
+            # "Failed to fetch"，看起来像导入失败。
             target_path = payload.get("path")
-            if target_path:
+            if target_path or payload.get("all"):
                 realm = payload.get("realm")
                 try:
-                    account = trae_accounts.import_desktop_credential(
-                        path=target_path, realm=realm)
+                    result = trae_accounts.import_desktop_credential(
+                        path=target_path, realm=realm) or {}
                 except Exception as exc:
                     return self._error(400, "import failed: %s" % exc)
-                log("imported %s (%s) from local client credential"
-                    % (account.uid[:8], account.realm), tag="accounts")
-                return self._json(200, {
-                    "imported": [account.public()],
-                    "accounts": account_views(),
-                    "pool_uids": [a.uid for a in POOL.accounts],
-                })
-            if payload.get("all"):
-                try:
-                    imported = trae_accounts.import_desktop_credential()
-                except Exception as exc:
-                    return self._error(400, "import failed: %s" % exc)
-                for account in imported:
+                imported = result.get("accounts") or []
+                for row in imported:
+                    if not isinstance(row, dict):
+                        continue
                     log("imported %s (%s) from local client credential"
-                        % (account.uid[:8], account.realm), tag="accounts")
+                        % (str(row.get("uidTail") or row.get("uid") or "")[-8:],
+                           row.get("realm") or realm or "-"), tag="accounts")
                 return self._json(200, {
-                    "imported": [a.public() for a in imported],
+                    "imported": imported,
+                    "errors": result.get("errors") or [],
+                    "found": result.get("found", len(imported)),
                     "accounts": account_views(),
                     "pool_uids": [a.uid for a in POOL.accounts],
                 })
