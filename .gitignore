@@ -31,3 +31,5 @@ Thumbs.db
 python/
 .tmp_*
 _acc/
+# launchd 服务包装脚本（由 restart-trae2api.sh 生成）
+.service-run.sh

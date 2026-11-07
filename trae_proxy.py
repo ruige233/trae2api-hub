@@ -10087,7 +10087,13 @@ class Handler(BaseHTTPRequestHandler):
         # 于是从看板模型清单里选号发起的请求**全部**走这里。
         t_start = time.time()
         fp = prompt_fingerprint(payload.get("messages"))
-        account = POOL.pick(realm="cn")
+        # 选号要和经典通道一致：会话粘性优先。经典链路在 open_upstream() 里会
+        # 先 extract_session_key() 再退化为 derive_affinity_key(前两条消息)；
+        # 这条 SOLO 分支最初只传 realm，等于关掉粘性 —— 池子里等权轮转时，
+        # 同一段对话会逐轮换号（实测 70 轮对话 acct 交替 70 次）。
+        session_key = (extract_session_key(self.headers, payload)
+                       or derive_affinity_key(payload.get("messages")))
+        account = POOL.pick(realm="cn", session_key=session_key)
         if not account:
             account = next((a for a in getattr(POOL, "accounts", []) if getattr(a, "realm", "") == "cn"), None)
         if not account:
