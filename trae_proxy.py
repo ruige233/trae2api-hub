@@ -5899,12 +5899,11 @@ def _solo_tool_calls(slots):
     return out
 
 
-def trae_solo_chat(account, payload, timeout=180):
-    """POST /api/agent/v3/llm_utils_chat (function=solo_work_lite).
+def _solo_request(account, payload, timeout=180):
+    """构造并发出一次 SOLO 请求，返回 (resp, model)。
 
-    This is the portable Trae SOLO channel used by Agent models. It only needs
-    the account access token plus the device identity; no SQLCipher, no AHA,
-    no local Trae CN process.
+    抽出来的原因：非流式 trae_solo_chat 与流式 trae_solo_stream 需要完全同一套
+    请求头/请求体（尤其设备身份与 tools.parameters 的字符串化），不能各写一份。
     """
     token = str(getattr(account, "token", "") or "").strip()
     if not token:
@@ -5962,23 +5961,73 @@ def trae_solo_chat(account, payload, timeout=180):
         "https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         headers=headers, method="POST")
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    return resp, model
+
+
+def _solo_iter_events(resp):
+    """逐行解析上游 SSE，产出 dict 事件；上游错误帧直接抛 RuntimeError。"""
+    for raw_line in resp:
+        event = _solo_data_object(raw_line.decode("utf-8", "replace"))
+        if event is None:
+            continue
+        if event.get("code") not in (None, 0):
+            raise RuntimeError("solo error %s: %s" % (event.get("code"), event.get("message") or event.get("msg") or ""))
+        yield event
+
+
+def trae_solo_stream(account, payload, timeout=180):
+    """流式版 SOLO 通道：逐帧 yield (kind, value)。
+
+    kind 取值：
+      "text"       增量正文（上游 response 片段本身就是增量，不必再切）
+      "reasoning"  增量思维链
+      "tool_calls" 上游增量 tool_calls 帧（首帧给 id/name，后续帧只给 arguments 片段）
+      "usage"      {"prompt_tokens", "completion_tokens", "total_tokens"}
+      "finish"     上游 finish_reason
+    上游在收尾时才带 token 用量，所以调用方必须等流走完才拿得到 usage。
+    """
+    resp, _model = _solo_request(account, payload, timeout)
     try:
-        resp = urllib.request.urlopen(req, timeout=timeout)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read(2000).decode("utf-8", "replace")
-        raise RuntimeError("solo HTTP %s: %s" % (exc.code, detail[:800]))
+        for event in _solo_iter_events(resp):
+            text = event.get("response")
+            if isinstance(text, str) and text:
+                yield ("text", text)
+            reasoning = event.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                yield ("reasoning", reasoning)
+            calls = event.get("tool_calls")
+            if isinstance(calls, list) and calls:
+                yield ("tool_calls", calls)
+            if "prompt_tokens" in event:
+                yield ("usage", {
+                    "prompt_tokens": int(event.get("prompt_tokens") or 0),
+                    "completion_tokens": int(event.get("completion_tokens") or 0),
+                    "total_tokens": int(event.get("total_tokens") or 0),
+                })
+            if event.get("finish_reason"):
+                yield ("finish", str(event["finish_reason"]))
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+def trae_solo_chat(account, payload, timeout=180):
+    """POST /api/agent/v3/llm_utils_chat (function=solo_work_lite).
+
+    This is the portable Trae SOLO channel used by Agent models. It only needs
+    the account access token plus the device identity; no SQLCipher, no AHA,
+    no local Trae CN process.
+    """
+    resp, model = _solo_request(account, payload, timeout)
     text_parts = []
     reasoning_parts = []
     tool_slots = {}
     finish_reason = "stop"
     usage = {}
     try:
-        for raw_line in resp:
-            event = _solo_data_object(raw_line.decode("utf-8", "replace"))
-            if event is None:
-                continue
-            if event.get("code") not in (None, 0):
-                raise RuntimeError("solo error %s: %s" % (event.get("code"), event.get("message") or event.get("msg") or ""))
+        for event in _solo_iter_events(resp):
             if event.get("response"):
                 text_parts.append(str(event["response"]))
             if event.get("reasoning_content"):
@@ -10031,35 +10080,33 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_agent_solo(self, payload):
         model = str(payload.get("model") or "deepseek-v4.1-flash")
+        # SOLO 通道同样要记账/要真流式：此前这条分支既不写 usage.jsonl 也不更新
+        # 汇总，而且把上游整段收完才一次性吐出（客户端看不到任何增量、usage 也
+        # 永远是 0）。而 SOLO_AGENT_MODELS 通过 `| set(SOLO_MODEL_ALIASES)` 把全部
+        # 20 个展示名（DeepSeek-V4-Flash / GLM-5.3 / Qwen3.8-Max …）都收了进来，
+        # 于是从看板模型清单里选号发起的请求**全部**走这里。
+        t_start = time.time()
+        fp = prompt_fingerprint(payload.get("messages"))
         account = POOL.pick(realm="cn")
         if not account:
             account = next((a for a in getattr(POOL, "accounts", []) if getattr(a, "realm", "") == "cn"), None)
         if not account:
             return self._error(503, "no CN account available", "server_error")
+        self.realm_used = "cn"
+        if payload.get("stream"):
+            return self._handle_agent_solo_stream(account, model, payload,
+                                                  t_start, fp)
         try:
             result = trae_solo_chat(account, {**payload, "model": model})
         except Exception as exc:
+            record_error(model, 502, str(exc),
+                         elapsed_ms=int((time.time() - t_start) * 1000))
             return self._error(502, "Trae SOLO upstream failed: %s" % exc, "upstream_error")
+        wall = int((time.time() - t_start) * 1000)
+        record_usage(model, result.get("usage"), stream=False, elapsed_ms=wall,
+                     fp=fp, account=getattr(account, "uid", "") or "",
+                     key_id=self._key_id_for_usage(), realm_reason="")
         tool_calls = result.get("tool_calls") or []
-        if payload.get("stream"):
-            self._sse_begin()
-            cid = "chatcmpl-" + uuid.uuid4().hex
-            delta = {"role": "assistant", "content": result["content"] or None}
-            if tool_calls:
-                delta["tool_calls"] = [
-                    {"index": i, "id": call["id"], "type": "function",
-                     "function": {"name": call["function"]["name"],
-                                  "arguments": call["function"]["arguments"]}}
-                    for i, call in enumerate(tool_calls)]
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
-                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-            self._sse_write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
-            done = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()), "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": result["finish_reason"]}]}
-            self._sse_write(("data: " + json.dumps(done, ensure_ascii=False) + "\n\n").encode("utf-8"))
-            self._sse_write(b"data: [DONE]\n\n")
-            self._sse_end()
-            return
         message = {"role": "assistant", "content": result["content"] or None,
                    "reasoning_content": result["reasoning"]}
         if tool_calls:
@@ -10076,6 +10123,116 @@ class Handler(BaseHTTPRequestHandler):
             "choices": [{"index": 0, "message": message, "finish_reason": result["finish_reason"]}],
             "usage": result["usage"] or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
+
+    def _handle_agent_solo_stream(self, account, model, payload, t_start, fp):
+        """SOLO 通道的真流式：上游每一帧立刻转成 OpenAI chunk 写出去。
+
+        修的两个问题（旧实现把整段收完再一次性 emit）：
+          1. 客户端看不到增量输出（"没有流式输出"）；
+          2. usage 从来不进流，于是客户端（DSH 等）记到 0 token。
+        收尾统一补一个 `choices: []` + `usage` 的帧（OpenAI include_usage 形态），
+        再补 finish_reason 帧 + [DONE]。
+        """
+        cid = "chatcmpl-" + uuid.uuid4().hex
+        created = int(time.time())
+
+        def _frame(delta, finish_reason=None, usage=None):
+            obj = {"id": cid, "object": "chat.completion.chunk",
+                   "created": created, "model": model, "choices": []}
+            if delta is not None:
+                obj["choices"] = [{"index": 0, "delta": delta,
+                                   "finish_reason": finish_reason}]
+            if usage:
+                obj["usage"] = usage
+            return ("data: " + json.dumps(obj, ensure_ascii=False)
+                    + "\n\n").encode("utf-8")
+
+        holder = {"usage": None, "finish": "stop", "calls": False,
+                  "first_at": None}
+
+        def _frames():
+            yield _frame({"role": "assistant", "content": ""})
+            for kind, value in trae_solo_stream(account,
+                                                {**payload, "model": model}):
+                if kind == "text":
+                    if holder["first_at"] is None:
+                        holder["first_at"] = time.time()
+                    yield _frame({"content": value})
+                elif kind == "reasoning":
+                    if holder["first_at"] is None:
+                        holder["first_at"] = time.time()
+                    yield _frame({"reasoning_content": value})
+                elif kind == "tool_calls":
+                    deltas = []
+                    for call in value:
+                        if not isinstance(call, dict):
+                            continue
+                        fn = call.get("function_call")
+                        fn = fn if isinstance(fn, dict) else {}
+                        try:
+                            index = int(call.get("index") or 0)
+                        except (TypeError, ValueError):
+                            index = 0
+                        delta = {"index": index, "type": "function",
+                                 "function": {}}
+                        if call.get("id"):
+                            delta["id"] = str(call["id"])
+                        if fn.get("name"):
+                            delta["function"]["name"] = str(fn["name"])
+                        frag = fn.get("arguments")
+                        if isinstance(frag, str) and frag:
+                            delta["function"]["arguments"] = frag
+                        deltas.append(delta)
+                    if deltas:
+                        holder["calls"] = True
+                        yield _frame({"tool_calls": deltas})
+                elif kind == "usage":
+                    holder["usage"] = value
+                elif kind == "finish":
+                    holder["finish"] = value
+
+        self._sse_begin()
+        aborted = False
+        try:
+            for chunk in sse_with_heartbeat(_frames(), self._sse_write):
+                self._sse_write(chunk)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # 客户端断开：上游已产出的部分照常记账，不再写流
+            aborted = True
+        except Exception as exc:
+            record_error(model, 502, str(exc),
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            try:
+                self._sse_write(_frame(
+                    {"content": "\n\n[网关错误] " + str(exc)[:300]}))
+            except Exception:
+                pass
+        usage = holder.get("usage")
+        finish = holder.get("finish") or "stop"
+        if holder["calls"]:
+            finish = "tool_calls"
+        elif finish not in ("stop", "length", "content_filter"):
+            finish = "stop"
+        if not aborted:
+            if usage:
+                try:
+                    self._sse_write(_frame(None, usage=usage))
+                except Exception:
+                    pass
+            try:
+                self._sse_write(_frame({}, finish_reason=finish))
+                self._sse_write(b"data: [DONE]\n\n")
+            except Exception:
+                pass
+        self._sse_end()
+        wall = int((time.time() - t_start) * 1000)
+        first_at = holder["first_at"]
+        ttft = int((first_at - t_start) * 1000) if first_at else None
+        record_usage(model, usage, stream=True, elapsed_ms=wall, ttft_ms=ttft,
+                     gen_ms=(wall - ttft) if ttft is not None else None,
+                     fp=fp, account=getattr(account, "uid", "") or "",
+                     key_id=self._key_id_for_usage(), realm_reason="")
+
 
     def _handle_agent_ui(self, payload):
         """Run a client_catalog Agent model through the local Trae CN UI bridge.
