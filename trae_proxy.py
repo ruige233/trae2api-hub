@@ -110,6 +110,15 @@ SOLO_AGENT_MODELS = {
     "Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Turbo", "Doubao-Seed-Evolving",
     "step-5-preview",
 } | set(SOLO_MODEL_ALIASES)
+# 上游 /api/agent/v3/llm_utils_chat 的 body.function 决定这批 key 是否被接受：
+# solo_work_lite 对下面三个 key 一律回 SSE `event:error {"code":4001,"message":
+# "We're sorry, the param is invalid..."}`（HTTP 200，所以要到解析帧时才炸成 502），
+# 换成 solo_agent 就能正常出流，且两者的 SSE 帧结构完全一致（output/token_usage/
+# done 事件集相同），下游解析代码无需改动。其余 key 两个 function 都能通，
+# 故按白名单分流而不是全量切换。矩阵实测见 2026-11-12 的 Seed-Code 502 排查。
+SOLO_AGENT_FUNCTION_MODELS = {
+    "Doubao-Seed-Code", "kimi-k2.8-preview", "qwen3.8-flash",
+}
 CURRENT_REALM = os.environ.get("TRAE_PROXY_DEFAULT_REALM", "cn")
 
 
@@ -6200,7 +6209,9 @@ def _solo_request(account, payload, timeout=180):
         raise RuntimeError("messages must not be empty")
     body = {
         "messages": messages,
-        "function": "solo_work_lite",
+        # 见 SOLO_AGENT_FUNCTION_MODELS 注释：这三个 key 只认 solo_agent。
+        "function": ("solo_agent" if model in SOLO_AGENT_FUNCTION_MODELS
+                     else "solo_work_lite"),
         "stream": True,
         "config_name": model,
         "model": model,
@@ -6266,7 +6277,7 @@ def trae_solo_stream(account, payload, timeout=180):
             pass
 
 def trae_solo_chat(account, payload, timeout=180):
-    """POST /api/agent/v3/llm_utils_chat (function=solo_work_lite).
+    """POST /api/agent/v3/llm_utils_chat (function=solo_work_lite / solo_agent).
 
     This is the portable Trae SOLO channel used by Agent models. It only needs
     the account access token plus the device identity; no SQLCipher, no AHA,

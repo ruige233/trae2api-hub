@@ -399,6 +399,57 @@ def main():
 
         check("测试期间未发生真实网络调用（solo 全部 mock）",
               all(c["model"] == MODEL for c in solo_calls), solo_calls[:2])
+
+        # ---------------------------------------------------------------
+        section("[7] body.function 按模型分流（solo_agent / solo_work_lite）")
+        # 上游 llm_utils_chat 的 function 决定这批 key 是否被接受：Seed-Code 那三个
+        # key 用 solo_work_lite 会回 4001（HTTP 200 + SSE error 帧），换 solo_agent
+        # 才通。这里直接截 _solo_request 发出的 body 校验分流，不打网络。
+        captured = []
+
+        class _FakeResp(object):
+            def close(self):
+                pass
+
+        def fake_urlopen(req, timeout=None):
+            captured.append(json.loads((req.data or b"{}").decode("utf-8")))
+            return _FakeResp()
+
+        saved_urlopen = P.urllib.request.urlopen
+        P.urllib.request.urlopen = fake_urlopen
+        try:
+            solo_account = mk_account("solo-fn-probe-1")
+            for display, key, want in (
+                    ("Seed-Code", "Doubao-Seed-Code", "solo_agent"),
+                    ("Kimi-K2.8-Preview", "kimi-k2.8-preview", "solo_agent"),
+                    ("Qwen3.8-Flash", "qwen3.8-flash", "solo_agent"),
+                    ("DeepSeek-V4.1-Flash", "deepseek-v4.1-flash", "solo_work_lite"),
+                    ("GLM-5.2", "glm-5.2", "solo_work_lite"),
+                    ("Kimi-K3", "kimi-k3", "solo_work_lite"),
+            ):
+                captured[:] = []
+                P._solo_request(solo_account, {"model": display,
+                                               "messages": [{"role": "user",
+                                                             "content": "hi"}]})
+                body = captured[0] if captured else {}
+                check("%s -> function=%s" % (display, want),
+                      body.get("function") == want,
+                      "%s (config_name=%s)" % (body.get("function"),
+                                               body.get("config_name")))
+                check("%s 的 config_name 走 alias 映射" % display,
+                      body.get("config_name") == key, body.get("config_name"))
+            # 白名单只包含这三个 key，别把可用模型一起切过去
+            check("SOLO_AGENT_FUNCTION_MODELS 恰好 3 个 key",
+                  P.SOLO_AGENT_FUNCTION_MODELS == {"Doubao-Seed-Code",
+                                                   "kimi-k2.8-preview",
+                                                   "qwen3.8-flash"},
+                  P.SOLO_AGENT_FUNCTION_MODELS)
+            check("分流白名单是 SOLO_AGENT_MODELS 的子集",
+                  P.SOLO_AGENT_FUNCTION_MODELS <= P.SOLO_AGENT_MODELS,
+                  P.SOLO_AGENT_FUNCTION_MODELS - P.SOLO_AGENT_MODELS)
+        finally:
+            P.urllib.request.urlopen = saved_urlopen
+
     finally:
         try:
             httpd.shutdown()
